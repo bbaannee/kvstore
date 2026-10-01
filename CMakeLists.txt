@@ -36,6 +36,13 @@ add_library(kv_storage
 )
 target_link_libraries(kv_storage PUBLIC kv_common)
 
+# Raft consensus as a pure state machine: no network, disk or clock access.
+add_library(kv_raft
+  src/raft/raft_log.cpp
+  src/raft/raft_node.cpp
+)
+target_include_directories(kv_raft PUBLIC src)
+
 # Command parsing + REPL, kept in a library so tests can use them.
 add_library(kv_cli
   src/cli/command.cpp
@@ -57,7 +64,10 @@ add_executable(kv_tests
   tests/kv_store_test.cpp
   tests/command_test.cpp
   tests/repl_test.cpp
+  tests/raft/raft_node_test.cpp
+  tests/raft/raft_cluster_test.cpp
 )
-target_link_libraries(kv_tests PRIVATE kv_cli GTest::gtest_main)
+target_include_directories(kv_tests PRIVATE tests)
+target_link_libraries(kv_tests PRIVATE kv_cli kv_raft GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(kv_tests)
