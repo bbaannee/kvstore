@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -14,6 +15,8 @@
 
 #include <gtest/gtest.h>
 
+#include "common/coding.h"
+#include "raft/entry_codec.h"
 #include "raft/raft_node.h"
 
 namespace kv::test {
@@ -24,6 +27,9 @@ namespace kv::test {
 // message loss, and every node's election timeouts. If a test fails, the
 // same seed reproduces it exactly.
 //
+// The "state machine" of each node is simply the list of entries it applied.
+// Snapshots of it are that list, serialized.
+//
 // While it runs, the cluster checks Raft's safety guarantees after every
 // step and fails the test the moment one is violated:
 //   - Election Safety: at most one leader per term.
@@ -33,13 +39,22 @@ class TestCluster {
 public:
     using NodeId = raft::NodeId;
 
-    explicit TestCluster(std::size_t size, std::uint64_t seed = 1) : rng_(seed) {
-        for (NodeId id = 1; id <= size; ++id) ids_.push_back(id);
-        seed_ = seed;
+    struct Options {
+        std::uint64_t seed = 1;
+        bool bootstrapConfig = false;  // write the initial configuration as log entry 1 (needed for membership changes)
+        std::size_t snapshotEvery = 0; // snapshot once this many entries were applied since the last (0 = never)
+        std::size_t snapshotChunkBytes = 256 * 1024;
+    };
+
+    explicit TestCluster(std::size_t size, std::uint64_t seed = 1) : TestCluster(size, Options{seed}) {}
+
+    TestCluster(std::size_t size, Options options) : options_(options), rng_(options.seed) {
+        for (NodeId id = 1; id <= size; ++id) initial_.push_back(id);
+        ids_ = initial_;
         for (NodeId id : ids_) {
             storage_[id] = {};
             applied_[id] = {};
-            start(id, seed);
+            start(id);
         }
     }
 
@@ -75,8 +90,7 @@ public:
     std::optional<NodeId> leader() {
         std::optional<NodeId> best;
         for (NodeId id : ids_)
-            if (isUp(id) && node(id).role() == raft::Role::Leader &&
-                (!best || node(id).term() > node(*best).term()))
+            if (isUp(id) && node(id).role() == raft::Role::Leader && (!best || node(id).term() > node(*best).term()))
                 best = id;
         return best;
     }
@@ -97,7 +111,7 @@ public:
         return ok;
     }
 
-    // Commands applied by a node's state machine, in order (no-ops skipped).
+    // Commands applied by a node's state machine, in order (no-ops and configuration entries skipped).
     std::vector<std::string> applied(NodeId id) const {
         std::vector<std::string> out;
         for (const auto& e : applied_.at(id))
@@ -105,16 +119,55 @@ public:
         return out;
     }
 
+    // --- Membership ---------------------------------------------------------
+
+    // Starts a new server that is not a member yet; it learns the cluster from the leader's log.
+    void addNode(NodeId id) {
+        ids_.push_back(id);
+        storage_[id] = {};
+        applied_[id] = {};
+        joining_.insert(id);
+        start(id);
+    }
+
+    // Asks the leader to change the configuration (it returns the error, if any).
+    raft::ConfigError proposeConfig(raft::Members members) {
+        auto l = leader();
+        if (!l) return raft::ConfigError::NotLeader;
+        raft::ConfigError error;
+        node(*l).proposeConfigChange(std::move(members), &error);
+        processReady(*l);
+        deliverAll();
+        return error;
+    }
+
+    // The current members as the leader sees them (including a change that hasn't committed yet).
+    raft::Members leaderMembers() {
+        auto l = leader();
+        return l ? node(*l).members() : raft::Members{};
+    }
+
+    // --- Snapshots ----------------------------------------------------------
+
+    // Makes a node snapshot its state machine now. Returns false if there's nothing new to cover.
+    bool snapshot(NodeId id) {
+        bool ok = node(id).compact(node(id).lastApplied(), serializeApplied(id));
+        processReady(id);
+        deliverAll();
+        return ok;
+    }
+
     // --- Failures ---------------------------------------------------------
 
     // The node stops; its volatile state is gone, its disk survives.
     void crash(NodeId id) { nodes_[id].reset(); }
 
-    // Restarts from what's on disk. The state machine is rebuilt from
-    // scratch, since Raft re-delivers committed entries from index 1.
+    // Restarts from what's on disk. The state machine is rebuilt from the
+    // snapshot (if any), then from the entries Raft re-delivers.
     void restart(NodeId id) {
-        start(id, seed_ * 1000 + restarts_++);
+        start(id);
         applied_[id].clear();
+        if (storage_[id].snapshot) applied_[id] = deserializeApplied(storage_[id].snapshot->data);
     }
 
     // Splits the network: nodes in `group` can talk only among themselves.
@@ -129,41 +182,85 @@ public:
 
     void setDropRate(double rate) { dropRate_ = rate; }
 
+    // How many snapshot chunks were sent in total (to see that InstallSnapshot really ran).
+    std::size_t snapshotChunksSent() const { return chunksSent_; }
+    std::size_t snapshotsInstalled() const { return installed_; }
+
 private:
     struct Disk {
         raft::HardState hardState;
-        std::vector<raft::Entry> log;  // log[i] has index i + 1
+        std::optional<raft::Snapshot> snapshot;
+        std::vector<raft::Entry> log;  // the entries after the snapshot
     };
 
-    void start(NodeId id, std::uint64_t seed) {
+    void start(NodeId id) {
         raft::Config cfg;
         cfg.id = id;
-        cfg.peers = ids_;
-        cfg.randomSeed = seed * 100 + id;
+        cfg.peers = initial_;
+        cfg.bootstrapConfigEntry = options_.bootstrapConfig;
+        cfg.joining = joining_.count(id) > 0;
+        cfg.snapshotChunkBytes = options_.snapshotChunkBytes;
+        cfg.randomSeed = options_.seed * 100 + id + restarts_[id]++ * 100000;
         const Disk& disk = storage_[id];
-        nodes_[id] = std::make_unique<raft::RaftNode>(cfg, disk.hardState, disk.log);
+        nodes_[id] = std::make_unique<raft::RaftNode>(cfg, disk.hardState, disk.log, disk.snapshot);
+    }
+
+    std::string serializeApplied(NodeId id) const {
+        std::string out;
+        putFixed64(out, applied_.at(id).size());
+        for (const auto& e : applied_.at(id)) raft::putEntry(out, e);
+        return out;
+    }
+
+    std::vector<raft::Entry> deserializeApplied(const std::string& bytes) const {
+        ByteReader in(bytes);
+        std::uint64_t count = 0;
+        std::vector<raft::Entry> out;
+        EXPECT_TRUE(in.getFixed64(count));
+        for (std::uint64_t i = 0; i < count; ++i) {
+            raft::Entry e;
+            EXPECT_TRUE(raft::getEntry(in, e));
+            out.push_back(std::move(e));
+        }
+        return out;
     }
 
     // Handles a node's Ready in the required order: persist, send, apply.
     void processReady(NodeId id) {
-        raft::RaftNode& n = node(id);
-        if (!n.hasReady()) return;
-        raft::Ready rd = n.takeReady();
+        while (isUp(id) && node(id).hasReady()) {
+            raft::RaftNode& n = node(id);
+            raft::Ready rd = n.takeReady();
 
-        Disk& disk = storage_[id];
-        if (rd.hardState) disk.hardState = *rd.hardState;
-        if (!rd.entries.empty()) {
-            disk.log.resize(rd.entries.front().index - 1);  // overwrite from here on
-            disk.log.insert(disk.log.end(), rd.entries.begin(), rd.entries.end());
+            Disk& disk = storage_[id];
+            if (rd.hardState) disk.hardState = *rd.hardState;
+            if (rd.snapshot) {
+                disk.snapshot = rd.snapshot;
+                disk.log = rd.entries;  // the whole log after the snapshot
+            } else if (!rd.entries.empty()) {
+                const raft::Index base = disk.snapshot ? disk.snapshot->index : 0;
+                disk.log.resize(rd.entries.front().index - 1 - base);  // overwrite from here on
+                disk.log.insert(disk.log.end(), rd.entries.begin(), rd.entries.end());
+            }
+
+            for (auto& m : rd.messages) {
+                if (const auto* chunk = std::get_if<raft::InstallSnapshot>(&m.body)) chunksSent_ += chunk->done ? 1 : 0;
+                inflight_.push_back(std::move(m));
+            }
+
+            if (rd.snapshot && rd.snapshotFromLeader) {
+                applied_[id] = deserializeApplied(rd.snapshot->data);
+                ++installed_;
+            }
+            for (const auto& e : rd.committedEntries) {
+                applied_[id].push_back(e);
+                checkStateMachineSafety(id, e);
+            }
+            checkElectionSafety(id);
+
+            const raft::Index sinceSnapshot = n.lastApplied() - n.snapshotIndex();
+            if (options_.snapshotEvery && sinceSnapshot >= options_.snapshotEvery)
+                n.compact(n.lastApplied(), serializeApplied(id));
         }
-
-        for (auto& m : rd.messages) inflight_.push_back(std::move(m));
-
-        for (const auto& e : rd.committedEntries) {
-            applied_[id].push_back(e);
-            checkStateMachineSafety(id, e);
-        }
-        checkElectionSafety(id);
     }
 
     // Delivers messages in random order until none are left.
@@ -174,6 +271,7 @@ private:
             raft::Message m = std::move(inflight_[pick]);
             inflight_.erase(inflight_.begin() + static_cast<std::ptrdiff_t>(pick));
 
+            if (std::find(ids_.begin(), ids_.end(), m.to) == ids_.end()) continue;
             if (!isUp(m.to) || cut_.count({m.from, m.to})) continue;
             if (dropRate_ > 0 && std::uniform_real_distribution<>(0, 1)(rng_) < dropRate_) continue;
 
@@ -195,16 +293,20 @@ private:
         EXPECT_EQ(it->second, e) << "node " << id << " applied a different entry at index " << e.index;
     }
 
+    Options options_;
+    std::vector<NodeId> initial_;
     std::vector<NodeId> ids_;
+    std::set<NodeId> joining_;
     std::map<NodeId, std::unique_ptr<raft::RaftNode>> nodes_;
     std::map<NodeId, Disk> storage_;
     std::map<NodeId, std::vector<raft::Entry>> applied_;
+    std::map<NodeId, int> restarts_;
     std::deque<raft::Message> inflight_;
     std::set<std::pair<NodeId, NodeId>> cut_;
     std::mt19937_64 rng_;
-    std::uint64_t seed_ = 1;
-    std::uint64_t restarts_ = 1;
     double dropRate_ = 0;
+    std::size_t chunksSent_ = 0;
+    std::size_t installed_ = 0;
 
     std::map<raft::Term, NodeId> leaderOfTerm_;
     std::map<raft::Index, raft::Entry> appliedAt_;

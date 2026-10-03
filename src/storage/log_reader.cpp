@@ -16,9 +16,28 @@ LogReader::LogReader(const std::string& path) : in_(path, std::ios::binary) {
     fileSize_ = ec ? 0 : size;  // missing file = empty log
 }
 
+ReadStatus LogReader::nextPayload(std::string& payload) {
+    std::uint64_t end = 0;
+    ReadStatus status = readFrame(payload, end);
+    if (status == ReadStatus::Ok) pos_ = end;
+    return status;
+}
+
+ReadStatus LogReader::next(LogRecord& out) {
+    std::string payload;
+    std::uint64_t end = 0;
+    ReadStatus status = readFrame(payload, end);
+    if (status != ReadStatus::Ok) return status;
+
+    // Checksum OK but unparseable: written by a buggy writer.
+    if (!decodePayload(payload, out)) return corrupt("malformed record");
+    pos_ = end;
+    return ReadStatus::Ok;
+}
+
 // The recovery rules. "Torn" is what a crash mid-write can leave behind, and
 // it's always at the end. Anything else is corruption.
-ReadStatus LogReader::next(LogRecord& out) {
+ReadStatus LogReader::readFrame(std::string& payload, std::uint64_t& end) {
     if (pos_ == fileSize_) return ReadStatus::End;
 
     // 1. Not even a full header left: the header was being written.
@@ -41,21 +60,16 @@ ReadStatus LogReader::next(LogRecord& out) {
 
     // 4. The length is trustworthy, so a payload running past the end of
     //    the file really is incomplete.
-    const std::uint64_t end = pos_ + kHeaderSize + length;
+    end = pos_ + kHeaderSize + length;
     if (end > fileSize_) return ReadStatus::Torn;
 
     // 5. Damaged payload: fine if it's the last record (or only zeros
     //    follow it), corruption otherwise.
-    const std::string payload = readAt(pos_ + kHeaderSize, length);
+    payload = readAt(pos_ + kHeaderSize, length);
     if (crc32c(payload) != payloadCrc) {
         if (end == fileSize_ || onlyZerosFrom(end)) return ReadStatus::Torn;
         return corrupt("bad payload checksum");
     }
-
-    // Checksum OK but unparseable: written by a buggy writer.
-    if (!decodePayload(payload, out)) return corrupt("malformed record");
-
-    pos_ = end;
     return ReadStatus::Ok;
 }
 

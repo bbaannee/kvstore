@@ -18,6 +18,10 @@ public:
     UniqueFd& operator=(const UniqueFd&) = delete;
 
     int get() const { return fd_; }
+    bool valid() const { return fd_ >= 0; }
+
+    // Gives up ownership without closing; the caller must close the fd.
+    int release() { int fd = fd_; fd_ = -1; return fd; }
 
 private:
     int fd_ = -1;

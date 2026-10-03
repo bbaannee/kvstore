@@ -153,6 +153,91 @@ TEST(RaftNode, DuplicateAppendDoesNotTruncate) {
     EXPECT_EQ(n.log().lastIndex(), 3u);
 }
 
+// A leader makes node 1 of {1, 2, 3} and returns it, with its pending output taken.
+RaftNode leaderOfThree() {
+    RaftNode n = freshNode(1);
+    tickUntilCandidate(n);
+    n.step(msg(2, 1, n.term(), RequestVoteResponse{true}));
+    n.takeReady();
+    return n;
+}
+
+const AppendEntries& appendTo(const Ready& rd, NodeId peer) {
+    for (const auto& m : rd.messages)
+        if (m.to == peer) return std::get<AppendEntries>(m.body);
+    throw std::logic_error("no AppendEntries to that peer");
+}
+
+// Entries that were already sent are not sent again on every heartbeat. A
+// big entry that takes a while to arrive would otherwise be re-sent over and
+// over, burying the follower in duplicates.
+TEST(RaftNode, DoesNotResendEntriesThatAreAlreadyInFlight) {
+    RaftNode n = leaderOfThree();
+    // The no-op was sent by becoming leader; here comes a command.
+    n.propose("big entry");
+    Ready sent = n.takeReady();
+    EXPECT_EQ(appendTo(sent, 2).entries.size(), 1u);  // the command (the no-op went out earlier)
+
+    // No answer yet. Heartbeats carry no entries, and point past the command.
+    for (int i = 0; i < 3; ++i) n.tick();
+    Ready heartbeat = n.takeReady();
+    EXPECT_TRUE(appendTo(heartbeat, 2).entries.empty());
+    EXPECT_EQ(appendTo(heartbeat, 2).prevLogIndex, n.log().lastIndex());
+}
+
+// If the optimistic assumption was wrong (the message got lost), the
+// follower rejects the next message and the leader goes back and re-sends.
+TEST(RaftNode, ResendsAfterAFollowerRejects) {
+    RaftNode n = leaderOfThree();
+    n.propose("a");
+    n.propose("b");
+    n.takeReady();  // pretend both messages were lost
+
+    for (int i = 0; i < 3; ++i) n.tick();
+    Ready heartbeat = n.takeReady();
+    ASSERT_TRUE(appendTo(heartbeat, 2).entries.empty());
+
+    // The follower has only the entry at index 0 (an empty log) and says so.
+    n.step(msg(2, 1, n.term(), AppendEntriesResponse{false, 0, 0}));
+    Ready resent = n.takeReady();
+    const auto& ae = appendTo(resent, 2);
+    EXPECT_EQ(ae.prevLogIndex, 0u);
+    EXPECT_EQ(ae.entries.size(), n.log().lastIndex());  // everything: no-op, a, b
+}
+
+// Batches are limited by bytes as well as by count, so a handful of big
+// entries can't add up to a message the network layer refuses.
+TEST(RaftNode, LimitsTheBytesInOneAppendEntries) {
+    RaftNode n = leaderOfThree();
+    const std::string big(600 * 1024, 'x');
+    n.propose(big);
+    n.propose(big);
+    n.propose(big);
+    n.takeReady();
+
+    // Force a re-send from the beginning: no-op, then three 600 KB entries.
+    n.step(msg(2, 1, n.term(), AppendEntriesResponse{false, 0, 0}));
+    Ready firstBatch = n.takeReady();
+    const auto& first = appendTo(firstBatch, 2);
+    ASSERT_EQ(first.entries.size(), 2u);  // the no-op and one big entry; a second would pass 1 MB
+    EXPECT_EQ(first.entries[1].data.size(), big.size());
+
+    // An entry bigger than the limit still goes out, alone.
+    RaftNode m = leaderOfThree();
+    m.propose(std::string(3 * 1024 * 1024, 'y'));
+    m.takeReady();
+    m.step(msg(2, 1, m.term(), AppendEntriesResponse{false, 0, 0}));
+    Ready noopBatch = m.takeReady();
+    const auto& noop = appendTo(noopBatch, 2);
+    ASSERT_EQ(noop.entries.size(), 1u);  // the no-op goes first, alone: adding the 3 MB entry would pass the limit
+
+    m.step(msg(2, 1, m.term(), AppendEntriesResponse{true, 1, 0}));
+    Ready hugeBatch = m.takeReady();
+    const auto& huge = appendTo(hugeBatch, 2);
+    ASSERT_EQ(huge.entries.size(), 1u);
+    EXPECT_EQ(huge.entries[0].data.size(), 3u * 1024 * 1024);
+}
+
 // Figure 8 in the Raft paper: a leader must not commit an entry from an
 // older term just because it's on a majority. A future leader could still
 // overwrite it. It becomes committed only together with a current-term entry.

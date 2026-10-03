@@ -10,14 +10,18 @@
 
 namespace kv::storage {
 
-LogWriter::LogWriter(const std::string& path) {
+LogWriter::LogWriter(const std::string& path, bool syncOnAppend) : syncOnAppend_(syncOnAppend) {
     bool existed = std::filesystem::exists(path);
     fd_ = openOrThrow(path, O_WRONLY | O_CREAT | O_APPEND);
-    if (!existed) fsyncParentDir(path);
+    if (!existed && syncOnAppend_) fsyncParentDir(path);
 }
 
-void LogWriter::append(const LogRecord& rec) {
-    writeAll(frameRecord(encodePayload(rec)));
+void LogWriter::appendPayload(std::string_view payload) {
+    writeAll(frameRecord(payload));
+    if (syncOnAppend_ && ::fsync(fd_.get()) != 0) throwErrno("fsync log");
+}
+
+void LogWriter::sync() {
     if (::fsync(fd_.get()) != 0) throwErrno("fsync log");
 }
 

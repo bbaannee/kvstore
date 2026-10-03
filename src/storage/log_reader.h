@@ -30,18 +30,27 @@ class LogReader {
 public:
     explicit LogReader(const std::string& path);
 
-    // Reads the next record into `out`. After anything other than Ok,
-    // the reader stays stopped at that position.
+    // Reads the next record's raw payload (checksums verified, contents not
+    // interpreted). After anything other than Ok, the reader stays stopped
+    // at that position.
+    ReadStatus nextPayload(std::string& payload);
+
+    // Same, but also parses the payload as a LogRecord (a payload that
+    // passes its checksum yet doesn't parse is reported as Corrupt).
     ReadStatus next(LogRecord& out);
 
     // Bytes from the start of the file to the end of the last good record.
     std::uint64_t validBytes() const { return pos_; }
 
-    // What was wrong, after next() returned Corrupt.
+    // What was wrong, after Corrupt was returned.
     const std::string& error() const { return error_; }
 
 private:
     ReadStatus corrupt(const std::string& what);
+
+    // Checks the record at pos_ without moving past it; `end` is where the
+    // record ends if the result is Ok.
+    ReadStatus readFrame(std::string& payload, std::uint64_t& end);
 
     // Reads exactly `n` bytes at `offset`; throws on I/O errors.
     std::string readAt(std::uint64_t offset, std::size_t n);

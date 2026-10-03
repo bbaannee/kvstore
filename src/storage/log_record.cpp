@@ -39,7 +39,9 @@ bool decodePayload(std::string_view payload, LogRecord& out) {
     out = LogRecord{};
 
     auto type = static_cast<LogRecord::Type>(payload[0]);
-    if (type != LogRecord::Type::Put && type != LogRecord::Type::Del) return false;
+    if (type != LogRecord::Type::Put && type != LogRecord::Type::Del &&
+        type != LogRecord::Type::Get)
+        return false;
     out.type = type;
 
     std::size_t pos = 1;

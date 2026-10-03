@@ -12,6 +12,7 @@ TEST(LogRecord, PayloadLayout) {
     // [type=1][key_len=1,0,0,0]['k'][value_len=2,0,0,0]['v','w']
     EXPECT_EQ(encodePayload(LogRecord::put("k", "vw")), std::string("\x01\x01\0\0\0k\x02\0\0\0vw", 12));
     EXPECT_EQ(encodePayload(LogRecord::del("k")), std::string("\x02\x01\0\0\0k", 6));
+    EXPECT_EQ(encodePayload(LogRecord::get("k")), std::string("\x03\x01\0\0\0k", 6));
 }
 
 TEST(LogRecord, RoundTripsAwkwardValues) {
@@ -22,6 +23,7 @@ TEST(LogRecord, RoundTripsAwkwardValues) {
              LogRecord::put("", "empty key"),
              LogRecord::put("k", std::string("a\0b", 3)),
              LogRecord::del("k"),
+             LogRecord::get("k"),
          }) {
         LogRecord out;
         ASSERT_TRUE(decodePayload(encodePayload(rec), out));

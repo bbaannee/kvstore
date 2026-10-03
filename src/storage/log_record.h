@@ -7,18 +7,22 @@
 
 namespace kv::storage {
 
-// One entry in the write-ahead log: a single change to the store.
+// One operation on the store. KvStore writes Put and Del to its write-ahead
+// log. In a replicated cluster the same bytes are the command carried by a
+// Raft entry; there, reads are commands too (Get), so they are ordered with
+// the writes. KvStore never logs a Get.
 struct LogRecord {
-    enum class Type : unsigned char { Put = 1, Del = 2 };
+    enum class Type : unsigned char { Put = 1, Del = 2, Get = 3 };
 
     Type type = Type::Put;
     std::string key;
-    std::string value;  // always empty for Del
+    std::string value;  // always empty for Del and Get
 
     static LogRecord put(std::string key, std::string value) {
         return {Type::Put, std::move(key), std::move(value)};
     }
     static LogRecord del(std::string key) { return {Type::Del, std::move(key), {}}; }
+    static LogRecord get(std::string key) { return {Type::Get, std::move(key), {}}; }
 
     bool operator==(const LogRecord&) const = default;
 };

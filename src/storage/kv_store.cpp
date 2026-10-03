@@ -53,7 +53,8 @@ RecoveryInfo KvStore::replay(const std::string& logPath) {
 
 void KvStore::apply(const LogRecord& rec) {
     if (rec.type == LogRecord::Type::Put) data_[rec.key] = rec.value;
-    else data_.erase(rec.key);
+    else if (rec.type == LogRecord::Type::Del) data_.erase(rec.key);
+    // Get changes nothing.
 }
 
 }  // namespace kv::storage

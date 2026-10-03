@@ -63,6 +63,22 @@ TEST(LogReader, ReadsAllRecords) {
     EXPECT_EQ(reader.validBytes(), allFramed().size());
 }
 
+// The log is generic: it carries any payload, not just LogRecords.
+TEST(LogReader, ReadsRawPayloads) {
+    kv::test::TempDir dir;
+    writeFile(dir.file("log"), frameRecord("first") + frameRecord("") + frameRecord(std::string("a\0b", 3)));
+
+    LogReader reader(dir.file("log"));
+    std::string p;
+    ASSERT_EQ(reader.nextPayload(p), ReadStatus::Ok);
+    EXPECT_EQ(p, "first");
+    ASSERT_EQ(reader.nextPayload(p), ReadStatus::Ok);
+    EXPECT_EQ(p, "");
+    ASSERT_EQ(reader.nextPayload(p), ReadStatus::Ok);
+    EXPECT_EQ(p, std::string("a\0b", 3));
+    EXPECT_EQ(reader.nextPayload(p), ReadStatus::End);
+}
+
 TEST(LogReader, ZeroFilledTailIsTorn) {
     kv::test::TempDir dir;
     writeFile(dir.file("log"), allFramed() + std::string(100, '\0'));
